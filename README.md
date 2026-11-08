@@ -22,11 +22,15 @@ parent ──delegate_task──▶ child ──"status: ok, changed: [a.py], ve
    prompt prefix, so the requirement is deterministic and costs no extra turn.
 2. **Checks it when the child stops.** The `subagent_stop` hook receives the child's summary, its
    status and a redacted tool history. The receipt is parsed, every claimed path is resolved and
-   hashed, the cited command is checked against an allow-list, corroborated against the tool
-   history, then **re-run** with no shell under a timeout.
-3. **Tells the parent.** Non-ok verdicts are appended to the `delegate_task` result by the
-   `transform_tool_result` hook, with the failing output attached, so the parent reads the
-   rejection instead of the child's own account of itself.
+   hashed, and each claim is **matched against the write targets that child's own history
+   records** — so a child cannot take credit for a file that exists because someone else wrote it.
+   The cited command is then checked against an allow-list, re-run with no shell, in its own
+   process group, with output and time bounded.
+3. **Tells the parent.** A non-ok verdict is appended to the `delegate_task` result by
+   `transform_tool_result`, with the failing output attached. A child dispatched in the background
+   returns `dispatched` before it finishes, so its verdict is delivered on the parent's next turn
+   by `pre_llm_call` instead. Either way the parent reads the rejection rather than the child's own
+   account of itself.
 4. **Keeps the record.** Every check lands in an append-only ledger, readable with
    `hermes receipts`.
 
@@ -62,9 +66,13 @@ write one — so almost everything comes back `missing`.
 |---|---|
 | A receipt block exists and parses | `missing` |
 | `status` is one of the four | `invalid` |
+| `status: ok` carries no outstanding `left` | `mismatch` |
+| The child finished, rather than being interrupted or stopped | `unverified` |
 | Every `changed` path is workspace-relative and exists | `invalid` |
-| The cited command is allow-listed, shell-free | `unverified` |
-| The child actually attempted that command | `unverified` |
+| The claim matches a file this child's own history records writing | `unverified` |
+| Something is proven at all: a real artefact, or a command naming one | `unverified` |
+| The cited command is allow-listed, bare-named, shell-free, not a launcher | `unverified` |
+| The child made a run-style tool call at all | `unverified` |
 | The command exits zero when re-run | `unverified` |
 
 The allow-list is `pytest`, `python`, `python3`, `uv`, `tox`, `nox`, `npm`, `pnpm`, `yarn`, `node`,
@@ -77,10 +85,14 @@ defaults to 120 seconds; `verify_timeout_seconds` changes it.
 - **It cannot veto a child.** The `subagent_stop` hook observes; it cannot cancel, rewrite or
   re-run the child. The verdict reaches the parent as text, and the parent decides. Making
   delegation refusal-able needs a core seam that does not exist yet.
-- **Corroboration is coarse.** The tool history handed to the hook is redacted — argument keys and
-  `targets` only — so "did the child attempt this command" is answered from the executable name
-  appearing in a terminal-style call. A child that ran `pytest tests/` and cited
-  `pytest -q other/` is corroborated and then caught by the re-run instead.
+- **Corroboration is argument-level, not textual.** Core redacts the hook payload to argument keys
+  and a fixed set of `targets` — and that set excludes `command`, so the command text never reaches
+  a plugin. "Did the child attempt this" is therefore answered from a run-style call carrying a
+  command or code argument, and the executable is proved by the re-run. A child that ran
+  `pytest tests/` and cited `pytest -q other/` is corroborated and then caught by the re-run.
+- **Attribution is a matching heuristic.** Claimed paths and recorded write targets are compared by
+  normalised suffix, because a child's cwd is not in the payload. A child that writes through a
+  script leaves no path target, so its claim is reported as unattributed rather than rejected.
 - **One command per receipt.** A receipt proves one thing. Multi-claim verification would need a
   list and a per-item verdict, which is scope this version does not take on.
 - **Prose is not policed.** The receipt is checked; the paragraphs around it are not. A child can
@@ -89,9 +101,15 @@ defaults to 120 seconds; `verify_timeout_seconds` changes it.
 ## Disclosure
 
 - The cited command is executed **with your privileges** in the agent's working directory. The
-  command comes from the subagent, which is the party being checked, so it is allow-listed,
-  shell-free, argv-split, time-bounded (120 s default) and given a filtered environment (`PATH`,
-  `HOME`, `LANG`, `LC_ALL`, `TZ`, `VIRTUAL_ENV`, `PYTHONPATH`).
+  command comes from the subagent, which is the party being checked, so it is allow-listed by bare
+  name, shell-free, argv-split, refused if it is a launcher (`env`, `xargs`, `find`, `sh`) or an
+  inline evaluation (`python3 -c`, `node -e`), time-bounded (120 s default) and given a filtered
+  environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `VIRTUAL_ENV`, `PYTHONPATH`). Output is
+  drained through a bounded buffer so a verbose run cannot exhaust memory, and the timeout kills
+  the whole process group.
+- **The re-run is not a sandbox.** `pytest` executes the workspace's `conftest.py`, and `npm test`
+  runs the project's own scripts, so re-running a cited command is choosing to execute code from
+  the tree the child worked in. The allow-list bounds *which* programs run, not what they contain.
 - The child's reply text and the paths it claims are read locally and never transmitted; the
   plugin makes no network calls and holds no credentials.
 - Verdicts are stored locally in `${HERMES_HOME}/plugin-data/delegation-receipts/ledger.jsonl`,

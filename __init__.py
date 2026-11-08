@@ -22,9 +22,10 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from .engine import DEFAULT_ALLOWED_COMMANDS, Verdict, verify
+from .engine import DEFAULT_ALLOWED_COMMANDS, Verdict, parse_receipt, verify
+from .routing import option_parameter, options_for, resolve_route
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +46,18 @@ CONTRACT = (
     "passed, not that the child says it did."
 )
 
-#: Verdicts from this process, awaiting a delegate_task result to annotate. Keyed by parent turn
-#: so a stale batch can never be attached to a later call.
-_PENDING: dict[str, list[dict[str, Any]]] = {}
+#: Shown above the contract when the user has model routes configured, so the model knows routing
+#: still works under this backend.
+ROUTE_NOTE = (
+    "Each task may set `option` to run that subagent on one of the listed model routes; the receipt "
+    "is required and checked either way."
+)
+
+#: Verdicts the parent has not seen yet, keyed by ``(parent_session_id, parent_turn_id)``. A
+#: verdict is handed only to the exact turn that produced it. An earlier version fell back to
+#: draining every session's queue, which delivered one parent's rejections into another parent's
+#: delegate_task result and left the owning parent with nothing.
+_PENDING: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
 
 def _hermes_home() -> Path:
@@ -95,7 +105,13 @@ def _provider_class() -> type:
     from agent.delegation_provider import DelegationProvider
 
     class ReceiptsDelegationProvider(DelegationProvider):
-        """Route exactly as the default backend does; the difference is the contract."""
+        """Verify every child's receipt, and keep the user's model routes working.
+
+        ``delegation.backend`` is exclusive in Hermes, so replacing ``model_map`` with this backend
+        would otherwise cost the user their per-task routing. Instead the provider reads the same
+        ``delegation.backends.model_map`` block and answers routes exactly as that backend would,
+        then requires the receipt on top. Installing this is a drop-in switch, not a downgrade.
+        """
 
         @property
         def name(self) -> str:
@@ -109,49 +125,124 @@ def _provider_class() -> type:
         def summary(self) -> str:
             return (
                 "Subagents must end with a receipt; claimed files and the cited command are "
-                "re-checked when the child stops."
+                "re-checked when the child stops. Keeps any model_map routes you have configured."
             )
 
+        def task_parameters(self, config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+            # Same `option` enum as model_map, so a task can still choose its route per subagent.
+            return option_parameter(config)
+
         def description(self, config: Mapping[str, Any]) -> str:
+            if options_for(config):
+                return f"{ROUTE_NOTE}\n\n{CONTRACT}"
             return CONTRACT
 
         def route_task(self, task: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
-            # Same route resolution as the bundled default backend: this plugin changes what is
-            # checked, never which model runs.
-            return {k: v for k, v in config.items() if k != "service_tier"}
+            # The route comes from the user's own model_map block; an empty answer means the child
+            # inherits the parent's route, which is core's behaviour for an unset delegation
+            # section. This plugin changes what is checked, never which model runs.
+            return resolve_route(task, config)
 
     return ReceiptsDelegationProvider
+
+
+def _workspace_root() -> Path:
+    """Where claimed paths are resolved when the child's own workspace is unknown."""
+    for key in ("HERMES_WORKDIR", "PWD"):
+        value = os.environ.get(key)
+        if value and Path(value).is_dir():
+            return Path(value)
+    return Path.cwd()
+
+
+def _root_from_history(changed: Sequence[str], history: Sequence[Mapping[str, Any]] | None) -> Path | None:
+    """Infer the child's workspace from an absolute write target in its own history.
+
+    The hook payload carries no child cwd. Claimed paths are workspace-relative, so an absolute
+    path this child wrote whose tail matches a claimed path tells us the prefix to strip — which is
+    the difference between checking the child's tree and checking the daemon's.
+    """
+    if not history:
+        return None
+    for call in history:
+        if not isinstance(call, Mapping):
+            continue
+        tool_input = call.get("tool_input")
+        targets = tool_input.get("targets") if isinstance(tool_input, Mapping) else None
+        if not isinstance(targets, Mapping):
+            continue
+        for key in ("path", "file_path", "target_path", "destination_path", "new_path"):
+            value = targets.get(key)
+            if not isinstance(value, str) or not os.path.isabs(value):
+                continue
+            written = Path(value).parts
+            for claimed in changed:
+                parts = Path(claimed).parts
+                if len(written) > len(parts) and written[-len(parts):] == parts:
+                    return Path(*written[: -len(parts)]) if len(written) > len(parts) else None
+    return None
+
+
+def _render(rows: Sequence[Mapping[str, Any]], *, header: str) -> str:
+    """The block the parent model reads: what was claimed, what failed, and what to do next."""
+    lines = ["", "", header]
+    for row in rows:
+        detail = "; ".join(row.get("problems") or []) or "no detail"
+        lines.append(f"- child {row.get('child')} — {row.get('status')}: {detail}")
+        for note in row.get("notes") or []:
+            lines.append(f"  note: {note}")
+        rerun = row.get("rerun") or {}
+        if rerun.get("tail"):
+            tail = str(rerun["tail"]).strip().splitlines()[-6:]
+            lines.append("  re-run output:")
+            lines.extend(f"  | {line}" for line in tail)
+    lines.append(
+        "Do not report this delegated work as complete until the rejection above is resolved."
+    )
+    return "\n".join(lines)
 
 
 def _on_subagent_stop(ctx: Any, **kwargs: Any) -> None:
     """Check one child's receipt the moment it stops."""
     try:
         child = str(kwargs.get("child_session_id") or kwargs.get("child_role") or "child")
-        parent_session_id = str(kwargs.get("parent_session_id") or "")
-        parent_turn_id = str(kwargs.get("parent_turn_id") or "")
+        key = (
+            str(kwargs.get("parent_session_id") or ""),
+            str(kwargs.get("parent_turn_id") or ""),
+        )
         summary = kwargs.get("child_summary") or ""
+        summary_text = summary if isinstance(summary, str) else str(summary)
         history = kwargs.get("tool_call_history")
+        history = history if isinstance(history, list) else None
+
+        receipt = parse_receipt(summary_text) or {}
+        changed = [str(item) for item in receipt.get("changed") or []]
+        root = _root_from_history(changed, history) or _workspace_root()
+
         verdict = verify(
-            summary if isinstance(summary, str) else str(summary),
-            root=_workspace_root(),
+            summary_text,
+            root=root,
             child=child,
-            tool_history=history if isinstance(history, list) else None,
+            child_status=kwargs.get("child_status"),
+            tool_history=history,
             allowed=_allowed(ctx),
             timeout=_timeout(ctx),
         )
         row = {
             "ts": time.time(),
-            "parent_session_id": parent_session_id,
-            "parent_turn_id": parent_turn_id,
+            "parent_session_id": key[0],
+            "parent_turn_id": key[1],
             "child": child,
             "child_role": kwargs.get("child_role"),
             "child_status": kwargs.get("child_status"),
             "duration_ms": kwargs.get("duration_ms"),
+            "root": str(root),
             **verdict.to_dict(),
         }
         _record(row)
         if not verdict.ok:
-            _PENDING.setdefault(parent_session_id or parent_turn_id or "*", []).append(row)
+            if key[0] or key[1]:
+                _PENDING.setdefault(key, []).append(row)
             logger.info("delegation-receipts rejected a child receipt: %s", verdict.summary_line())
     except Exception:  # a broken verifier must never break delegation
         logger.warning("delegation-receipts failed while checking a child", exc_info=True)
@@ -159,54 +250,59 @@ def _on_subagent_stop(ctx: Any, **kwargs: Any) -> None:
 
 
 def _on_transform_tool_result(ctx: Any, **kwargs: Any) -> str | None:
-    """Attach any rejected verdicts to the delegate_task result the parent model reads."""
+    """Attach rejections to the delegate_task result the parent reads, inline sessions only."""
     try:
         if str(kwargs.get("tool_name") or "") != "delegate_task":
             return None
-        if not _PENDING:
-            return None
-        # Prefer verdicts recorded for this session; only fall back to the whole queue when the
-        # host gives us no session to match on. A stale batch must never attach to a later call.
-        current = str(kwargs.get("session_id") or "") or None
-        keys = [k for k in _PENDING if current and k == current] or list(_PENDING)
-        rows: list[dict[str, Any]] = []
-        for key in keys:
-            rows.extend(_PENDING.pop(key, []))
+        args = kwargs.get("args")
+        if isinstance(args, Mapping) and str(args.get("action") or "") in {"list", "steer", "stop"}:
+            return None  # a status call is not a delivery of work
+        key = (
+            str(kwargs.get("session_id") or kwargs.get("parent_session_id") or ""),
+            str(kwargs.get("turn_id") or kwargs.get("parent_turn_id") or ""),
+        )
+        rows = _PENDING.get(key)
         if not rows:
             return None
         result = kwargs.get("result")
         if not isinstance(result, str) or not result:
-            return None
-        lines = [
-            "",
-            "",
-            "RECEIPT CHECK (delegation-receipts re-checked the work each child claims):",
-        ]
-        for row in rows:
-            kind = row.get("status")
-            detail = "; ".join(row.get("problems") or []) or "no detail"
-            lines.append(f"- child {row.get('child')} — {kind}: {detail}")
-            rerun = row.get("rerun") or {}
-            if rerun.get("tail"):
-                tail = str(rerun["tail"]).strip().splitlines()[-6:]
-                lines.append("  re-run output:")
-                lines.extend(f"  | {line}" for line in tail)
-        lines.append(
-            "Do not report this delegated work as complete until the rejection above is resolved."
+            return None  # keep the queue: nothing was delivered
+        _PENDING.pop(key, None)
+        return result + _render(
+            rows, header="RECEIPT CHECK (delegation-receipts re-checked the work each child claims):"
         )
-        return result + "\n".join(lines)
     except Exception:
         logger.warning("delegation-receipts could not annotate a delegate_task result", exc_info=True)
         return None
 
 
-def _workspace_root() -> Path:
-    """Where claimed paths are resolved: the agent's working directory."""
-    for key in ("HERMES_WORKDIR", "PWD"):
-        value = os.environ.get(key)
-        if value and Path(value).is_dir():
-            return Path(value)
-    return Path.cwd()
+def _on_pre_llm_call(ctx: Any, **kwargs: Any) -> dict[str, Any] | None:
+    """Deliver verdicts for background children, which never reach transform_tool_result.
+
+    ``delegate_task`` in background mode returns "dispatched" and the child's result re-enters the
+    conversation as a later message, so the inline transform never sees it. This hook hands the
+    parent the checks it has not been told about, on the next turn, in the same turn's context.
+    """
+    try:
+        session = str(kwargs.get("session_id") or "")
+        if not session:
+            return None
+        keys = [key for key in list(_PENDING) if key[0] == session]
+        if not keys:
+            return None
+        rows: list[dict[str, Any]] = []
+        for key in keys:
+            rows.extend(_PENDING.pop(key, []))
+        if not rows:
+            return None
+        text = _render(
+            rows,
+            header="RECEIPT CHECK (checks that finished after your delegate_task returned):",
+        ).strip()
+        return {"context": text}
+    except Exception:
+        logger.warning("delegation-receipts could not deliver pending verdicts", exc_info=True)
+        return None
 
 
 def _setup_cli(parser: Any) -> None:
@@ -269,8 +365,12 @@ def register(ctx: Any) -> None:
     def transform_tool_result(**kwargs: Any) -> str | None:
         return _on_transform_tool_result(ctx, **kwargs)
 
+    def pre_llm_call(**kwargs: Any) -> dict[str, Any] | None:
+        return _on_pre_llm_call(ctx, **kwargs)
+
     ctx.register_hook("subagent_stop", subagent_stop)
     ctx.register_hook("transform_tool_result", transform_tool_result)
+    ctx.register_hook("pre_llm_call", pre_llm_call)
     ctx.register_cli_command(
         name="receipts",
         help="Delegation receipt checks: claimed status versus what was verified",

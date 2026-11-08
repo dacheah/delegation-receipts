@@ -22,11 +22,14 @@ command the child claims proves the work. ``left`` is free text or ``none``.
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import os
 import re
 import shlex
+import signal
 import subprocess
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -64,6 +67,16 @@ DEFAULT_ALLOWED_COMMANDS = (
 #: so anything that only means something to a shell is either an error or an injection.
 _SHELL_METACHARS = re.compile(r"[;&|<>`$(){}*?~\\\n]")
 
+#: An allow-listed interpreter can still be asked to evaluate a string instead of running a file.
+#: ``python3 -c pass`` exits zero and proves nothing, and it is the cheapest way to fake a receipt,
+#: so inline evaluation is refused: a proof must name a file or drive a test runner.
+INLINE_EVAL_HEADS = frozenset({"python", "python3", "node"})
+INLINE_EVAL_FLAGS = frozenset({"-c", "-e", "--eval", "--exec", "-"})
+
+#: A claimed file larger than this is hashed by size only, so a receipt cannot make the host read a
+#: multi-gigabyte artefact while it holds the turn.
+HASH_SIZE_CAP = 64 * 1024 * 1024
+
 _FENCE = re.compile(r"```[ \t]*(?:receipt|RECEIPT)[ \t]*\r?\n(?P<body>.*?)```", re.S)
 _BARE = re.compile(r"(?:^|\n)[ \t]*RECEIPT[ \t]*\r?\n(?P<body>(?:.*\n?)*)\Z", re.S)
 
@@ -80,8 +93,11 @@ class Verdict:
     receipt_present: bool = False
     claimed_status: str | None = None
     problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
     files_checked: list[dict[str, Any]] = field(default_factory=list)
     command: str | None = None
+    left: str | None = None
+    child_status: str | None = None
     corroborated: bool | None = None
     rerun: dict[str, Any] | None = None
 
@@ -171,14 +187,54 @@ def _is_safe_relative(path: str) -> bool:
 
 
 def sha256_of(path: Path) -> str | None:
+    """Hash a claimed artefact, capped at :data:`HASH_SIZE_CAP` so a huge file cannot stall a turn."""
     try:
         digest = hashlib.sha256()
+        remaining = HASH_SIZE_CAP
         with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
+            while remaining > 0:
+                chunk = handle.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
                 digest.update(chunk)
+                remaining -= len(chunk)
         return digest.hexdigest()
     except OSError:
         return None
+
+
+def _inside(path: Path, base: Path) -> bool:
+    """Whether ``path`` resolves to somewhere under ``base``, following symlinks both ways."""
+    try:
+        real = path.resolve()
+        root = base.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return real == root or root in real.parents
+
+
+def _command_references_existing(command: str, base: str | os.PathLike[str]) -> bool:
+    """Whether any argument of ``command`` names a file that exists.
+
+    This is the vacuity guard's other half: a read-only task cannot claim a changed file, so it is
+    allowed to prove itself by naming the artefact it checked instead.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    root = Path(base)
+    for token in argv[1:]:
+        candidate = token.split("=", 1)[-1] if "=" in token else token
+        candidate = candidate.strip().strip("'\"")
+        if not candidate or candidate.startswith("-"):
+            continue
+        try:
+            if (root / candidate).is_file():
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
 
 
 def check_files(paths: Sequence[str], root: str | os.PathLike[str]) -> tuple[list[dict[str, Any]], list[str]]:
@@ -198,6 +254,13 @@ def check_files(paths: Sequence[str], root: str | os.PathLike[str]) -> tuple[lis
             exists = target.is_file()
         except OSError:
             exists = False
+        # A path can be relative and still leave the workspace through a symlink, so the textual
+        # check above is not the boundary: the resolved path is.
+        if exists and not _inside(target, base):
+            row["problem"] = "resolves outside the workspace"
+            problems.append(f"claimed path resolves outside the workspace: {raw}")
+            rows.append(row)
+            continue
         row["exists"] = exists
         if exists:
             row["bytes"] = target.stat().st_size
@@ -207,6 +270,18 @@ def check_files(paths: Sequence[str], root: str | os.PathLike[str]) -> tuple[lis
             problems.append(f"claimed file does not exist: {raw}")
         rows.append(row)
     return rows, problems
+
+
+#: Interpreters and wrappers whose whole purpose is to run a different program, so an allow-listed
+#: name would otherwise smuggle an arbitrary one: `env python3 -c ...`, `find . -exec sh -c`.
+DEPUTY_HEADS = frozenset({
+    "env", "xargs", "find", "timeout", "nice", "nohup", "sudo", "su", "doas", "script",
+    "sh", "bash", "zsh", "dash", "fish", "eval", "exec", "command", "systemd-run", "watch",
+    "parallel", "setsid", "chroot", "unshare", "busybox",
+})
+
+#: Argument flags that hand execution to a named program.
+DEPUTY_FLAGS = frozenset({"-exec", "-execdir", "-ok", "--eval", "--exec"})
 
 
 def command_problem(command: str, allowed: Sequence[str] = DEFAULT_ALLOWED_COMMANDS) -> str | None:
@@ -221,40 +296,139 @@ def command_problem(command: str, allowed: Sequence[str] = DEFAULT_ALLOWED_COMMA
         return f"command does not parse: {exc}"
     if not argv:
         return "no command given"
+    # A path is not a name. `./pytest` and `/tmp/pytest` both basename to an allowed executable, so
+    # the first version let a child drop its own script in the workspace and "prove" itself with it.
+    if "/" in argv[0] or "\\" in argv[0]:
+        return f"executable must be a bare name resolved from PATH, not a path: {argv[0]}"
     head = os.path.basename(argv[0])
     if head not in set(allowed):
         return f"executable not on the allow-list: {head}"
+    if head in DEPUTY_HEADS:
+        return f"{head} runs another program and is refused: cite the program itself"
+    if head in INLINE_EVAL_HEADS and any(token in INLINE_EVAL_FLAGS for token in argv[1:]):
+        return "inline evaluation proves nothing and is refused: cite a file or a test command"
+    if any(token in DEPUTY_FLAGS for token in argv[1:]):
+        return "command hands control to another program and is refused"
     return None
 
 
-def is_corroborated(command: str, tool_history: Sequence[Mapping[str, Any]] | None) -> bool | None:
-    """Did the child actually attempt this command?
+#: Tools whose call names the file it writes. Core keeps path-style targets in the hook history,
+#: which is the only attribution evidence a plugin actually receives.
+WRITE_TOOLS = frozenset({
+    "write_file", "patch", "edit_file", "apply_patch", "create_file", "append_file",
+    "replace_in_file", "str_replace", "multiedit", "notebook_edit", "edit",
+})
 
-    ``subagent_stop`` hands us a redacted history: tool names, argument keys and a ``targets``
-    mapping — never the raw argument text. So corroboration is deliberately generous: the
-    command's executable must appear in a terminal-ish tool call. ``None`` means the host gave
-    us no history at all, which is *unknown*, never "yes".
+#: Tools that run something. Core strips the command text from the hook history and keeps only
+#: ``cwd``-style targets, so the strongest attribution available is "this child made a run-style
+#: call carrying a command or code argument".
+RUN_TOOLS = frozenset({"terminal", "execute_code", "bash", "shell", "run_command", "process"})
+
+#: Statuses that mean the child finished its turn rather than being cut short.
+COMPLETED_STATUSES = frozenset({"completed", "complete", "ok", "success", "succeeded", "done"})
+
+
+def _argument_keys(call: Mapping[str, Any]) -> list[str]:
+    tool_input = call.get("tool_input")
+    keys = tool_input.get("argument_keys") if isinstance(tool_input, Mapping) else None
+    return [str(key).lower() for key in keys] if isinstance(keys, list) else []
+
+
+def _targets(call: Mapping[str, Any]) -> Mapping[str, Any]:
+    tool_input = call.get("tool_input")
+    targets = tool_input.get("targets") if isinstance(tool_input, Mapping) else None
+    return targets if isinstance(targets, Mapping) else {}
+
+
+def was_attempted(tool_history: Sequence[Mapping[str, Any]] | None) -> bool | None:
+    """Did this child run anything at all?
+
+    The hook history never carries command text: core's target-key set is
+    ``{cwd, path, url, ...}`` and deliberately excludes ``command``. An earlier version of this
+    engine searched the history for the executable name, which could never match a real payload,
+    and so rejected every honest child. The evidence below is what the host genuinely provides.
+    ``None`` means no history was supplied at all, which is unknown, never yes.
     """
     if tool_history is None:
         return None
-    try:
-        argv = shlex.split(command)
-    except ValueError:
-        return False
-    if not argv:
-        return False
-    head = os.path.basename(argv[0])
-    terminal_tools = {"terminal", "execute_code", "bash", "shell", "run_command"}
     for call in tool_history:
         if not isinstance(call, Mapping):
             continue
-        name = str(call.get("tool_name") or "").lower()
-        if name not in terminal_tools:
+        if str(call.get("tool_name") or "").lower() not in RUN_TOOLS:
             continue
-        blob = repr(call.get("tool_input") or {})
-        if head in blob:
+        keys = _argument_keys(call)
+        if not keys or {"command", "cmd", "code"} & set(keys):
             return True
     return False
+
+
+def write_targets(tool_history: Sequence[Mapping[str, Any]] | None) -> list[str]:
+    """Every path this child's write-style tool calls named, as the host recorded them."""
+    found: list[str] = []
+    if not tool_history:
+        return found
+    for call in tool_history:
+        if not isinstance(call, Mapping):
+            continue
+        if str(call.get("tool_name") or "").lower() not in WRITE_TOOLS:
+            continue
+        targets = _targets(call)
+        for key in ("path", "file_path", "target_path", "destination_path", "new_path", "dst"):
+            value = targets.get(key)
+            if isinstance(value, str) and value.strip():
+                found.append(_norm(value))
+    return found
+
+
+def _norm(value: str) -> str:
+    text = str(value).strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.rstrip("/")
+
+
+def _same_path(claimed: str, observed: str) -> bool:
+    left, right = _norm(claimed), _norm(observed)
+    return bool(left and right) and (left == right or left.endswith("/" + right) or right.endswith("/" + left))
+
+
+def _attribution(
+    rows: Sequence[Mapping[str, Any]], tool_history: Sequence[Mapping[str, Any]] | None
+) -> tuple[list[str], str | None]:
+    """Compare the files a child claims with the writes its own history records.
+
+    Returns (notes, fatal). A note is a soft observation — the child may have written through a
+    script, which leaves no path target. The fatal case is narrow on purpose: the child made
+    writes, and not one of them is a file it claims.
+    """
+    notes: list[str] = []
+    observed = write_targets(tool_history)
+    claimed = [str(row.get("path")) for row in rows if row.get("exists")]
+    if tool_history is None or not observed or not claimed:
+        return notes, None
+    unmatched = [path for path in claimed if not any(_same_path(path, seen) for seen in observed)]
+    for row in rows:
+        if row.get("exists"):
+            row["written"] = not any(_same_path(str(row.get("path")), seen) for seen in observed)
+    if unmatched and len(unmatched) == len(claimed):
+        return notes, "none of the claimed files was written by this child: " + ", ".join(unmatched[:4])
+    if unmatched:
+        notes.append("claimed but not among this child's writes: " + ", ".join(unmatched[:4]))
+    unclaimed = [seen for seen in observed if not any(_same_path(claimed_path, seen) for claimed_path in claimed)]
+    if unclaimed:
+        notes.append("written but not claimed: " + ", ".join(unclaimed[:4]))
+    return notes, None
+
+
+def _kill_group(proc: subprocess.Popen[str]) -> None:
+    """Kill the whole process group, so a grandchild cannot outlive the check."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def run_command(
@@ -263,27 +437,74 @@ def run_command(
     *,
     timeout: float = 120.0,
     env_allow: Sequence[str] = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "VIRTUAL_ENV", "PYTHONPATH"),
+    keep_lines: int = 400,
+    line_cap: int = 8192,
 ) -> dict[str, Any]:
-    """Run an allow-listed command as an argv list, no shell, bounded by ``timeout``."""
-    argv = shlex.split(command)
-    env = {k: os.environ[k] for k in env_allow if k in os.environ}
+    """Run an allow-listed command as an argv list: no shell, own process group, bounded output.
+
+    A child chooses this command, so it must not be able to decide what this process costs: the
+    output is drained through a bounded deque (the first version buffered everything and let a
+    verbose run take the host's RSS with it), and the timeout kills the group rather than the
+    direct child, so no `sleep` survives a check.
+    """
     try:
-        proc = subprocess.run(
+        argv = shlex.split(command)
+    except ValueError as exc:
+        return {"ran": False, "timed_out": False, "returncode": None, "tail": str(exc)}
+    env = {key: os.environ[key] for key in env_allow if key in os.environ}
+    try:
+        proc = subprocess.Popen(
             argv,
             cwd=str(cwd),
             env=env,
             shell=False,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=timeout,
+            errors="replace",
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        return {"ran": True, "timed_out": True, "returncode": None, "tail": f"timed out after {timeout}s"}
     except (OSError, ValueError) as exc:
         return {"ran": False, "timed_out": False, "returncode": None, "tail": str(exc)}
-    output = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    tail = output[-1500:] if len(output) > 1500 else output
-    return {"ran": True, "timed_out": False, "returncode": proc.returncode, "tail": tail}
+
+    tail: collections.deque[str] = collections.deque(maxlen=keep_lines)
+    total = 0
+
+    def _drain() -> None:
+        nonlocal total
+        stream = proc.stdout
+        if stream is None:
+            return
+        for line in stream:
+            total += len(line)
+            tail.append(line[:line_cap])
+
+    reader = threading.Thread(target=_drain, daemon=True)
+    reader.start()
+    timed_out = threading.Event()
+
+    def _expire() -> None:
+        timed_out.set()
+        _kill_group(proc)
+
+    timer = threading.Timer(timeout, _expire)
+    timer.start()
+    try:
+        returncode = proc.wait()
+    finally:
+        timer.cancel()
+        reader.join(timeout=2.0)
+        if proc.stdout is not None:
+            proc.stdout.close()
+
+    joined = "".join(tail)
+    return {
+        "ran": True,
+        "timed_out": timed_out.is_set(),
+        "returncode": None if timed_out.is_set() else returncode,
+        "tail": joined[-1500:],
+        "output_bytes": total,
+    }
 
 
 def verify(
@@ -291,6 +512,7 @@ def verify(
     *,
     root: str | os.PathLike[str],
     child: str = "",
+    child_status: str | None = None,
     tool_history: Sequence[Mapping[str, Any]] | None = None,
     allowed: Sequence[str] = DEFAULT_ALLOWED_COMMANDS,
     runner: Callable[..., dict[str, Any]] | None = None,
@@ -304,7 +526,7 @@ def verify(
     exists, and the cited command is allow-listed, corroborated by the tool history, and exits
     zero when re-run. Nothing is inferred from prose.
     """
-    verdict = Verdict(child=child)
+    verdict = Verdict(child=child, child_status=str(child_status) if child_status else None)
     receipt = parse_receipt(text)
     if receipt is None:
         verdict.status = "missing"
@@ -326,37 +548,78 @@ def verify(
         verdict.problems.append(f"child reported status {claimed}, not ok")
         return verdict
 
-    if require_files:
-        rows, problems = check_files(receipt.get("changed") or [], root)
-        verdict.files_checked = rows
-        verdict.problems.extend(problems)
+    # A child that was interrupted, failed or was stopped did not finish: its claim of "ok" is not
+    # a lie so much as an artefact of a cut-short run, and the parent must not read it as success.
+    if verdict.child_status and verdict.child_status.strip().lower() not in COMPLETED_STATUSES:
+        verdict.status = "unverified"
+        verdict.problems.append(f"the child ended as {verdict.child_status}, not completed")
+        return verdict
 
+    # "ok" with work still outstanding is a contradiction in the receipt itself.
+    left = str(receipt.get("left") or "").strip()
+    verdict.left = left or None
+    if left and left.strip().lower() not in {"none", "-", "nil", "nothing", "n/a"}:
+        verdict.status = "mismatch"
+        verdict.problems.append(f"status ok but work is outstanding: {left}")
+        return verdict
+
+    changed = [str(item) for item in (receipt.get("changed") or [])]
     command = (receipt.get("verified") or "").strip()
     verdict.command = command or None
+
+    if require_files:
+        rows, problems = check_files(changed, root)
+        verdict.files_checked = rows
+        verdict.problems.extend(problems)
+        # A receipt must prove *something*. With no artefact on disk and no file named by the cited
+        # command, "status: ok" asserts nothing at all: `changed: []` with a passing no-op would
+        # otherwise be recorded as verified work.
+        if not any(row.get("exists") for row in rows) and not _command_references_existing(command, root):
+            verdict.status = "unverified"
+            verdict.problems.append(
+                "nothing was proven: no claimed file exists and the cited command names no "
+                "workspace file"
+            )
+            return verdict
+        # Attribute the claim to the writes this child actually made.
+        notes, fatal = _attribution(rows, tool_history)
+        verdict.notes.extend(notes)
+        if fatal:
+            verdict.status = "unverified"
+            verdict.problems.append(fatal)
+            return verdict
+
     blocker = command_problem(command, allowed)
     if blocker:
-        verdict.problems.append(blocker)
         verdict.status = "unverified"
+        verdict.problems.append(blocker)
         return verdict
 
     if require_corroboration:
-        verdict.corroborated = is_corroborated(command, tool_history)
+        verdict.corroborated = was_attempted(tool_history)
         if verdict.corroborated is False:
-            verdict.problems.append("the cited command was never attempted by this child")
             verdict.status = "unverified"
+            verdict.problems.append("this child made no run-style tool call, so the cited command was never attempted")
+            return verdict
+        if verdict.corroborated is None:
+            verdict.status = "unverified"
+            verdict.problems.append(
+                "the host supplied no tool history for this child, so the cited command cannot be "
+                "attributed to it"
+            )
             return verdict
 
     run = (runner or run_command)(command, root, timeout=timeout)
     verdict.rerun = run
     if not run.get("ran"):
+        verdict.status = "unverified"
         verdict.problems.append(f"could not re-run the cited command: {str(run.get('tail', ''))[:200]}")
-        verdict.status = "unverified"
     elif run.get("timed_out"):
+        verdict.status = "unverified"
         verdict.problems.append(f"the cited command did not finish within {timeout}s")
-        verdict.status = "unverified"
     elif run.get("returncode") != 0:
-        verdict.problems.append(f"the cited command failed on re-run (exit {run.get('returncode')})")
         verdict.status = "unverified"
+        verdict.problems.append(f"the cited command failed on re-run (exit {run.get('returncode')})")
 
     if verdict.problems:
         if verdict.status == "ok":

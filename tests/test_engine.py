@@ -12,11 +12,16 @@ import pytest
 
 from delegation_receipts_plugin import engine  # loaded once by tests/conftest.py
 
-# The literal shape Hermes hands a subagent_stop hook: argument keys and targets only.
+# The literal shape Hermes hands a subagent_stop hook. `tools/delegate_tool_results.py` builds it
+# with `_summarize_tool_arguments` -> `_input_summary`, whose target keys are
+# `{cwd, path, file_path, target_path, destination_path, new_path, dst, src, url, ...}` and
+# deliberately EXCLUDE `command`. An earlier version of this file invented `targets: {"command": …}`
+# and so validated a payload core cannot emit; `test_fixture_matches_core_summariser` now checks
+# that claim against the host itself when a Hermes tree is available.
 REAL_TOOL_HISTORY = [
     {
         "tool_name": "write_file",
-        "tool_input": {"argument_keys": ["content", "path"], "targets": {"path": "notes/report.txt"}},
+        "tool_input": {"argument_keys": ["content", "path"], "targets": {"path": "src/engine.py"}},
         "input_bytes": 128,
         "output_bytes": 32,
         "status": "ok",
@@ -26,12 +31,14 @@ REAL_TOOL_HISTORY = [
 TERMINAL_HISTORY = [
     {
         "tool_name": "terminal",
-        "tool_input": {"argument_keys": ["command"], "targets": {"command": "pytest -q tests/test_engine.py"}},
+        "tool_input": {"argument_keys": ["command", "timeout"], "targets": {}},
         "input_bytes": 64,
         "output_bytes": 512,
         "status": "ok",
     }
 ]
+
+WRITE_AND_RUN_HISTORY = REAL_TOOL_HISTORY + TERMINAL_HISTORY
 
 GOOD = """Work complete.
 
@@ -164,17 +171,63 @@ def test_executable_off_the_allow_list_is_refused(workspace):
     assert runner.calls == []
 
 
-def test_command_never_attempted_is_caught_from_real_history():
-    assert engine.is_corroborated("pytest -q", TERMINAL_HISTORY) is True
-    assert engine.is_corroborated("pytest -q", REAL_TOOL_HISTORY) is False
+def test_a_run_style_call_counts_as_attempted():
+    assert engine.was_attempted(TERMINAL_HISTORY) is True
+    assert engine.was_attempted(REAL_TOOL_HISTORY) is False
+    assert engine.was_attempted(None) is None
     # No history at all is unknown, never a pass.
-    assert engine.is_corroborated("pytest -q", None) is None
 
 
-def test_uncorroborated_command_is_rejected(workspace):
-    verdict = engine.verify(GOOD, root=workspace, tool_history=REAL_TOOL_HISTORY, runner=_runner())
+def test_a_claim_with_no_matching_write_is_rejected(workspace):
+    """The child wrote an unrelated file and claims src/engine.py: the claim is not its own work."""
+    history = [
+        {
+            "tool_name": "write_file",
+            "tool_input": {"argument_keys": ["content", "path"], "targets": {"path": "notes/report.txt"}},
+            "input_bytes": 128,
+            "output_bytes": 32,
+            "status": "ok",
+        },
+        {
+            "tool_name": "terminal",
+            "tool_input": {"argument_keys": ["command", "timeout"], "targets": {}},
+            "input_bytes": 64,
+            "output_bytes": 512,
+            "status": "ok",
+        },
+    ]
+    verdict = engine.verify(GOOD, root=workspace, tool_history=history, runner=_runner())
     assert verdict.status == "unverified"
-    assert "never attempted" in verdict.problems[0]
+    assert "none of the claimed files was written by this child" in verdict.problems[0]
+
+
+def test_no_run_style_call_is_rejected(workspace):
+    history = [
+        {
+            "tool_name": "write_file",
+            "tool_input": {"argument_keys": ["content", "path"], "targets": {"path": "src/engine.py"}},
+            "input_bytes": 128,
+            "output_bytes": 32,
+            "status": "ok",
+        }
+    ]
+    verdict = engine.verify(GOOD, root=workspace, tool_history=history, runner=_runner())
+    assert verdict.status == "unverified"
+    assert "no run-style tool call" in verdict.problems[0]
+
+
+def test_absent_history_is_unknown_not_yes(workspace):
+    """The docstring's promise, now enforced: no history means no attribution, never a pass."""
+    verdict = engine.verify(GOOD, root=workspace, tool_history=None, runner=_runner())
+    assert verdict.status == "unverified"
+    assert "no tool history" in verdict.problems[0]
+
+
+def test_write_and_run_history_verifies(workspace):
+    verdict = engine.verify(
+        GOOD, root=workspace, tool_history=WRITE_AND_RUN_HISTORY, runner=_runner()
+    )
+    assert verdict.ok, verdict.problems
 
 
 def test_timeout_is_a_failure_not_a_pass(workspace):

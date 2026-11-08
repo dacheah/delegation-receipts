@@ -1,20 +1,24 @@
 name: delegation-receipts
 label: Delegation Receipts
 kind: standalone
-version: 0.1.0
+version: 0.2.0
 author: danielcheah
 homepage: https://github.com/dacheah/delegation-receipts
 description: >
-  Verify what a subagent says it did. Every child is asked to end its reply
-  with a machine-checkable receipt (status, changed files, the one command
-  that proves the work); when the child stops, the plugin checks each claimed
-  file exists, confirms the cited command was actually attempted, re-runs it
-  with no shell and a timeout, and appends the verdict to the result the
-  parent model reads. A child that says "all 14 tests pass" when 3 fail comes
-  back marked unverified, with the failing output attached. Set
-  `delegation.backend: receipts`; `hermes receipts` shows the ledger.
+  Verify what a subagent says it did. Every child ends its reply with a
+  machine-checkable receipt (status, changed files, the one command that
+  proves the work). When the child stops, the plugin checks each claimed file
+  exists, matches the claim against the writes the child's own tool history
+  records, re-runs the cited command with no shell, its own process group and
+  a timeout, and hands the verdict to the parent - inline on the tool result,
+  or on the next turn for a background child. A child that says "all 14 tests
+  pass" when 3 fail comes back marked unverified with the failing output
+  attached. Claimed-but-never-written work is caught even when the file
+  exists. Set `delegation.backend: receipts`; `hermes receipts` shows the
+  ledger.
 requires_hermes: ">=0.22.5"
 provides_tools: []
 provides_hooks:
   - subagent_stop
   - transform_tool_result
+  - pre_llm_call
