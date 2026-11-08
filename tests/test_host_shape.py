@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import glob
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -128,7 +129,7 @@ def verified_child(tmp_path):
     target = workspace / "data.json"
     target.write_text('{"ok": true}\n', encoding="utf-8")
     return {
-        "child_summary": _receipt(["data.json"], "python3 -m json.tool data.json"),
+        "child_summary": _receipt(["data.json"], "pytest -q data.json"),
         "tool_call_history": [_write_call(target), _run_call()],
         "workspace": workspace,
     }
@@ -175,7 +176,7 @@ def test_delivery_skips_status_calls(verified_child, tmp_path):
         parent_session_id="s1",
         parent_turn_id="t1",
         child_status="completed",
-        child_summary=_receipt(["data.json"], "python3 -m json.tool data.json"),
+        child_summary=_receipt(["data.json"], "pytest -q data.json"),
         tool_call_history=_rejected_history(target.parent),
     )
     for action in ("list", "steer", "stop"):
@@ -199,7 +200,7 @@ def test_background_verdict_arrives_on_a_later_turn(verified_child):
         parent_session_id="s9",
         parent_turn_id="t9",
         child_status="completed",
-        child_summary=_receipt(["data.json"], "python3 -m json.tool data.json"),
+        child_summary=_receipt(["data.json"], "pytest -q data.json"),
         tool_call_history=_rejected_history(verified_child["workspace"]),
     )
     injected = plugin._on_pre_llm_call(ctx, session_id="s9", user_message="anything")
@@ -208,19 +209,23 @@ def test_background_verdict_arrives_on_a_later_turn(verified_child):
     assert plugin._on_pre_llm_call(ctx, session_id="s9") is None
 
 
-def test_a_clean_child_is_not_reported(tmp_path):
+def test_a_clean_child_is_not_reported(tmp_path, monkeypatch):
     ctx = Ctx()
     plugin._PENDING.clear()
     target = tmp_path / "ws" / "data.json"
     target.parent.mkdir()
     target.write_text('{"ok": true}\n', encoding="utf-8")
+    # The cited shape must exit zero for real, so the workspace carries a passing test and the
+    # runner's own directory is on PATH — the receipt is not allowed to cite an interpreter.
+    (target.parent / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}")
     plugin._on_subagent_stop(
         ctx,
         child_session_id="c3",
         parent_session_id="s1",
         parent_turn_id="t1",
         child_status="completed",
-        child_summary=_receipt(["data.json"], "python3 -m json.tool data.json"),
+        child_summary=_receipt(["data.json"], "pytest -q test_ok.py"),
         tool_call_history=[_write_call(target), _run_call()],
     )
     assert not plugin._PENDING, "a verified child must not clutter the parent's context"
@@ -238,7 +243,7 @@ def test_interrupted_child_is_not_a_success(tmp_path):
         parent_session_id="s1",
         parent_turn_id="t1",
         child_status="interrupted",
-        child_summary=_receipt(["data.json"], "python3 -m json.tool data.json"),
+        child_summary=_receipt(["data.json"], "pytest -q data.json"),
         tool_call_history=[_write_call(target), _run_call()],
     )
     rows = plugin._PENDING[("s1", "t1")]
@@ -305,5 +310,5 @@ def test_bare_names_only_no_path_execution(tmp_path):
     fake = tmp_path / "pytest"
     fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake.chmod(0o755)
-    assert engine.command_problem(str(fake), engine.DEFAULT_ALLOWED_COMMANDS)
-    assert engine.command_problem("./pytest -q", engine.DEFAULT_ALLOWED_COMMANDS)
+    assert engine.command_problem(str(fake))
+    assert engine.command_problem("./pytest -q")

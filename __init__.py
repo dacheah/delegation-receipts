@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .engine import DEFAULT_ALLOWED_COMMANDS, Verdict, parse_receipt, verify
+from .engine import Verdict, parse_receipt, verify
 from .routing import option_parameter, options_for, resolve_route
 
 logger = logging.getLogger(__name__)
@@ -60,8 +60,39 @@ ROUTE_NOTE = (
 _PENDING: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
 
+def _declined_root_verdict(child: Any, child_status: Any, command: str | None) -> Verdict:
+    """A verdict for a child whose working directory cannot be proven.
+
+    The hook payload carries no child cwd, so the only fallback is the daemon's own
+    ``HERMES_WORKDIR``/``PWD`` — which is not evidence about the child. Re-running there would check
+    the wrong tree and hand the parent a verdict about someone else's files, so the command is not
+    run, and the receipt reads unverified with the reason.
+    """
+    verdict = Verdict(child=child, child_status=child_status)
+    verdict.status = "unverified"
+    verdict.command = command
+    verdict.problems.append(
+        "the child's working directory could not be proven from its own history and the hook "
+        "payload carries no child cwd, so the cited command was not re-run rather than run in the "
+        "daemon's directory"
+    )
+    return verdict
+
+
 def _hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    """The active profile's home.
+
+    ``get_hermes_home`` is Hermes' own resolution (profile selection, install root, env), so the
+    ledger follows whichever profile is running rather than whichever env var this process happens
+    to carry. The env/`~/.hermes` pair survives only as the fallback for running outside Hermes,
+    where there is no profile to follow.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
 
 def data_dir() -> Path:
@@ -81,16 +112,6 @@ def _record(row: Mapping[str, Any]) -> None:
             handle.write(json.dumps(dict(row), sort_keys=True) + "\n")
     except OSError as exc:  # never fail a turn because the ledger could not be written
         logger.warning("delegation-receipts could not append to the ledger: %s", exc)
-
-
-def _allowed(ctx: Any) -> tuple[str, ...]:
-    try:
-        configured = ctx.get_config("allowed_commands", None)
-    except Exception:
-        configured = None
-    if isinstance(configured, (list, tuple)) and configured:
-        return tuple(str(item) for item in configured)
-    return DEFAULT_ALLOWED_COMMANDS
 
 
 def _timeout(ctx: Any) -> float:
@@ -217,17 +238,23 @@ def _on_subagent_stop(ctx: Any, **kwargs: Any) -> None:
 
         receipt = parse_receipt(summary_text) or {}
         changed = [str(item) for item in receipt.get("changed") or []]
-        root = _root_from_history(changed, history) or _workspace_root()
-
-        verdict = verify(
-            summary_text,
-            root=root,
-            child=child,
-            child_status=kwargs.get("child_status"),
-            tool_history=history,
-            allowed=_allowed(ctx),
-            timeout=_timeout(ctx),
-        )
+        proven = _root_from_history(changed, history)
+        root = proven or _workspace_root()
+        if proven is None:
+            verdict = _declined_root_verdict(
+                child,
+                kwargs.get("child_status"),
+                (receipt.get("verified") or "").strip() or None,
+            )
+        else:
+            verdict = verify(
+                summary_text,
+                root=root,
+                child=child,
+                child_status=kwargs.get("child_status"),
+                tool_history=history,
+                timeout=_timeout(ctx),
+            )
         row = {
             "ts": time.time(),
             "parent_session_id": key[0],

@@ -1,7 +1,7 @@
 name: delegation-receipts
 label: Delegation Receipts
 kind: standalone
-version: 0.2.0
+version: 0.3.0
 author: danielcheah
 homepage: https://github.com/dacheah/delegation-receipts
 description: >

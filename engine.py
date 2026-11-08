@@ -38,30 +38,37 @@ CONTRACT_VERSION = 1
 
 STATUSES = ("ok", "partial", "blocked", "failed")
 
-#: Executables a receipt may cite. Anything else is refused before it is run: a receipt is
-#: written by the child, and the child is the thing we do not trust.
-DEFAULT_ALLOWED_COMMANDS = (
-    "pytest",
-    "python",
-    "python3",
-    "uv",
-    "tox",
-    "nox",
-    "npm",
-    "pnpm",
-    "yarn",
-    "node",
-    "cargo",
-    "go",
-    "make",
-    "just",
-    "ruff",
-    "mypy",
-    "tsc",
-    "jest",
-    "vitest",
-    "rspec",
+#: The complete set of command shapes a receipt may cite: ``(program, required leading tokens)``.
+#: The boundary is the shape, not the binary. A binary allow-list gates on a name and lets every
+#: invocation that name accepts through, so ``python helper.py`` (a file the child just wrote),
+#: ``npm install <pkg>`` and ``cargo run`` all pass it — each one an arbitrary entry point wearing a
+#: fixed verb. Gate on the whole shape and those shapes are not on the list.
+COMMAND_SHAPES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("pytest", ()),
+    ("uv", ("run", "--no-sync", "pytest")),
+    ("cargo", ("test",)),
+    ("go", ("test",)),
+    ("npm", ("test",)),
+    ("pnpm", ("test",)),
+    ("yarn", ("test",)),
 )
+
+#: Flags each shape may carry, closed. ``-p`` loads an arbitrary importable module into pytest and
+#: ``-exec`` replaces a test binary's runner: neither is a flag, both are entry points.
+SHAPE_FLAGS: dict[str, frozenset[str]] = {
+    "pytest": frozenset({"-q", "-x"}),
+    "uv run --no-sync pytest": frozenset({"-q", "-x"}),
+    "cargo test": frozenset({"--lib", "--tests", "--bins"}),
+    "go test": frozenset({"-count=1"}),
+    "npm test": frozenset(),
+    "pnpm test": frozenset(),
+    "yarn test": frozenset(),
+}
+
+#: ``uv run pytest`` without ``--no-sync`` is refused: a sync materialises and executes build
+#: backends the child could have authored minutes earlier. ``--no-sync`` fails instead of reaching
+#: for the network when the environment is stale, which is fail-closed by construction.
+_REQUIRED_LEAD = "uv run --no-sync pytest"
 
 #: Shell syntax is refused outright: the command is executed as an argv list with no shell,
 #: so anything that only means something to a shell is either an error or an injection.
@@ -284,8 +291,45 @@ DEPUTY_HEADS = frozenset({
 DEPUTY_FLAGS = frozenset({"-exec", "-execdir", "-ok", "--eval", "--exec"})
 
 
-def command_problem(command: str, allowed: Sequence[str] = DEFAULT_ALLOWED_COMMANDS) -> str | None:
-    """Return why ``command`` may not be run, or ``None`` when it is acceptable."""
+#: Token guards. argv carries no shell, so nothing here is expanded — but the validation is
+#: asserted rather than assumed, because a runner that later grows a shell would turn each of these
+#: into an injection. A target carrying `=`, `$`, a leading `/` or `~`, or a `..` segment is refused.
+_BAD_TOKEN = re.compile(r"[=$]|^[/~]")
+
+
+def _target_problem(token: str) -> str | None:
+    """Why ``token`` may not be used as a target, or ``None``."""
+    if _BAD_TOKEN.search(token):
+        return f"target carries shell or absolute-path syntax and is refused: {token}"
+    if ".." in token.split("/"):
+        return f"target escapes the workspace and is refused: {token}"
+    return None
+
+
+def _tail_problem(key: str, tail: Sequence[str]) -> str | None:
+    """Validate the tokens after a shape's leading words."""
+    flags = SHAPE_FLAGS[key]
+    bare = 0
+    for token in tail:
+        if token in flags:
+            continue
+        if token.startswith("-"):
+            return f"flag not permitted for `{key}`: {token}"
+        problem = _target_problem(token)
+        if problem:
+            return problem
+        bare += 1
+        if key in ("npm test", "pnpm test", "yarn test"):
+            return f"`{key}` takes no arguments: {token}"
+        if key == "cargo test" and bare > 1:
+            return f"`cargo test` takes one name filter at most: {token}"
+        if key == "go test" and not token.startswith("./"):
+            return f"`go test` targets must be package paths of the ./ shape: {token}"
+    return None
+
+
+def command_problem(command: str) -> str | None:
+    """Return why ``command`` may not be run, or ``None`` when it is an accepted shape."""
     if not command or not command.strip():
         return "no command given"
     if _SHELL_METACHARS.search(command):
@@ -296,20 +340,23 @@ def command_problem(command: str, allowed: Sequence[str] = DEFAULT_ALLOWED_COMMA
         return f"command does not parse: {exc}"
     if not argv:
         return "no command given"
-    # A path is not a name. `./pytest` and `/tmp/pytest` both basename to an allowed executable, so
-    # the first version let a child drop its own script in the workspace and "prove" itself with it.
+    # A path is not a name: `./pytest` would otherwise run the child's own executable.
     if "/" in argv[0] or "\\" in argv[0]:
         return f"executable must be a bare name resolved from PATH, not a path: {argv[0]}"
     head = os.path.basename(argv[0])
-    if head not in set(allowed):
-        return f"executable not on the allow-list: {head}"
     if head in DEPUTY_HEADS:
-        return f"{head} runs another program and is refused: cite the program itself"
-    if head in INLINE_EVAL_HEADS and any(token in INLINE_EVAL_FLAGS for token in argv[1:]):
-        return "inline evaluation proves nothing and is refused: cite a file or a test command"
-    if any(token in DEPUTY_FLAGS for token in argv[1:]):
-        return "command hands control to another program and is refused"
-    return None
+        return f"{head} runs another program and is refused: cite the test command itself"
+    for program, lead in COMMAND_SHAPES:
+        if head != program or tuple(argv[1:1 + len(lead)]) != lead:
+            continue
+        tail = argv[1 + len(lead):]
+        if any(token in DEPUTY_FLAGS for token in tail):
+            return "command hands control to another program and is refused"
+        key = " ".join((program, *lead)) if lead else program
+        return _tail_problem(key, tail)
+    if head == "uv":
+        return f"`uv` is permitted only as `{_REQUIRED_LEAD} ...`: a bare `uv run` syncs first"
+    return f"command shape not permitted: {head} {' '.join(argv[1:3])}".strip()
 
 
 #: Tools whose call names the file it writes. Core keeps path-style targets in the hook history,
@@ -452,6 +499,21 @@ def run_command(
     except ValueError as exc:
         return {"ran": False, "timed_out": False, "returncode": None, "tail": str(exc)}
     env = {key: os.environ[key] for key in env_allow if key in os.environ}
+    # Confinement is checked here, at execution, against the real path: a prefix match on the
+    # argument text is defeated by `..` and by a symlink the child could have planted in its own
+    # tree. A target that resolves outside the proven workspace is refused, not clamped.
+    root = os.path.realpath(str(cwd))
+    for token in argv[1:]:
+        if token.startswith("-"):
+            continue
+        try:
+            target = os.path.realpath(os.path.join(root, token))
+            inside = os.path.commonpath([root, target]) == root
+        except (OSError, ValueError):
+            inside = False
+        if not inside:
+            return {"ran": False, "timed_out": False, "returncode": None,
+                    "tail": f"target resolves outside the workspace: {token}"}
     try:
         proc = subprocess.Popen(
             argv,
@@ -514,7 +576,6 @@ def verify(
     child: str = "",
     child_status: str | None = None,
     tool_history: Sequence[Mapping[str, Any]] | None = None,
-    allowed: Sequence[str] = DEFAULT_ALLOWED_COMMANDS,
     runner: Callable[..., dict[str, Any]] | None = None,
     timeout: float = 120.0,
     require_files: bool = True,
@@ -589,7 +650,7 @@ def verify(
             verdict.problems.append(fatal)
             return verdict
 
-    blocker = command_problem(command, allowed)
+    blocker = command_problem(command)
     if blocker:
         verdict.status = "unverified"
         verdict.problems.append(blocker)

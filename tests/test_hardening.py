@@ -53,17 +53,23 @@ def test_inline_python_evaluation_is_refused():
     """`python3 -c pass` exits zero and proves nothing: it was the cheapest fake receipt."""
     problem = engine.command_problem("python3 -c pass")
     assert problem is not None
-    assert "inline evaluation" in problem
+    assert "not permitted" in problem
 
 
 def test_node_eval_is_refused():
     assert engine.command_problem("node -e 1") is not None
 
 
-def test_interpreter_running_a_file_is_allowed():
-    """The rule bans evaluation, not interpreters: running a named file is still a proof."""
-    assert engine.command_problem("python3 -m json.tool out.json") is None
-    assert engine.command_problem("python3 tests/run_checks.py") is None
+def test_interpreters_are_refused_in_every_shape():
+    """An interpreter is an arbitrary entry point whatever follows it: `-m mod`, a file the child
+    wrote a minute ago, a bare REPL. None of them is a check, so the head itself is refused."""
+    assert engine.command_problem("python3 -m json.tool out.json") is not None
+    assert engine.command_problem("python3 tests/run_checks.py") is not None
+    assert engine.command_problem("python -m pytest -q") is not None
+    assert engine.command_problem("node run.js") is not None
+    assert engine.command_problem("make test") is not None
+    assert engine.command_problem("just test") is not None
+    assert engine.command_problem("tox") is not None
 
 
 # --------------------------------------------------------------------------- vacuity
@@ -84,7 +90,7 @@ def test_read_only_receipt_naming_an_existing_file_is_accepted(workspace):
     """A task that changed nothing may still prove itself by naming what it checked."""
     text = (
         "```receipt\nstatus: ok\nchanged: none\n"
-        "verified: python3 -m json.tool src/engine.py\nleft: none\n```\n"
+        "verified: pytest -q src/engine.py\nleft: none\n```\n"
     )
     verdict = engine.verify(
         text, root=workspace, tool_history=None, runner=_runner(), require_corroboration=False

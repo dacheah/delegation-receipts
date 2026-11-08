@@ -162,7 +162,7 @@ def test_shell_syntax_is_refused_before_it_runs():
 
 def test_executable_off_the_allow_list_is_refused(workspace):
     assert engine.command_problem("curl http://example.com") == (
-        "executable not on the allow-list: curl"
+        "command shape not permitted: curl http://example.com"
     )
     text = GOOD.replace("pytest -q tests/test_engine.py", "curl http://example.com")
     runner = _runner()
