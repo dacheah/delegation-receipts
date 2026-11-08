@@ -340,8 +340,27 @@ def _handle_cli(args: Any) -> int:
     for row in recent:
         mark = "ok  " if row.get("ok") else "FAIL"
         claimed = row.get("claimed_status") or "-"
-        detail = "; ".join(row.get("problems") or [])[:120]
-        print(f"  {mark} {str(row.get('child', '?'))[:24]:24} claimed={claimed:8} {detail}")
+        head = f"  {mark} {str(row.get('child', '?'))[:24]:24} claimed={claimed:8} "
+        detail = "; ".join(row.get("problems") or [])
+        if not detail:
+            print(head.rstrip())
+            continue
+        # Wrap rather than truncate: a verdict cut off mid-sentence reads as a bug on camera and to
+        # the parent, and the reason is the whole point of the line.
+        words, lines, current = detail.split(" "), [], ""
+        for word in words:
+            trial = f"{current} {word}".strip()
+            if len(head) + len(trial) <= 150 or not current:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+        print(head + lines[0])
+        for extra in lines[1:]:
+            print(" " * len(head) + extra)
+        for note in row.get("notes") or []:
+            print(" " * len(head) + f"note: {note}")
     return 0
 
 
