@@ -28,12 +28,47 @@ from .engine import Verdict, parse_receipt, verify
 from .routing import option_parameter, options_for, resolve_route
 
 def is_receipts_backend_active(config: Mapping[str, Any] | None) -> bool:
-    if not config:
+    """True only when the resolved ``delegation.backend`` is this plugin's backend."""
+    if not isinstance(config, Mapping):
         return False
-    delegation = config.get("delegation")
-    if isinstance(delegation, Mapping):
-        return delegation.get("backend") == BACKEND_NAME
-    return False
+    section = config.get("delegation")
+    if not isinstance(section, Mapping):
+        # Accept the section itself, which is what ``saved_backend()`` reports.
+        section = config if "backend" in config else None
+    if section is None:
+        return False
+    name = section.get("backend")
+    return isinstance(name, str) and name.strip().lower() == BACKEND_NAME
+
+
+def _delegation_section(ctx: Any) -> Mapping[str, Any] | None:
+    """The host's ``delegation`` block, from whichever surface this host exposes.
+
+    ``PluginContext`` has no ``.config``, and its ``get_config`` reads plugin-scoped settings, so the
+    backend is read where core reads it: ``agent.delegation_backends.saved_backend()``. Test doubles
+    and hosts that do expose a config mapping still resolve through it first.
+    """
+    for attr in ("config", "_config"):
+        cfg = getattr(ctx, attr, None)
+        if isinstance(cfg, Mapping):
+            section = cfg.get("delegation")
+            if isinstance(section, Mapping):
+                return section
+            if "backend" in cfg:
+                return cfg
+    try:
+        from agent.delegation_backends import saved_backend
+
+        return {"backend": saved_backend()}
+    except Exception:  # older host, or a test environment without core on the path
+        return None
+
+
+def _receipts_backend_active(ctx: Any) -> bool:
+    section = _delegation_section(ctx)
+    if section is None:
+        return False
+    return is_receipts_backend_active(section)
 
 logger = logging.getLogger(__name__)
 
@@ -234,9 +269,9 @@ def _render(rows: Sequence[Mapping[str, Any]], *, header: str) -> str:
 def _on_subagent_stop(ctx: Any, **kwargs: Any) -> None:
     """Check one child's receipt the moment it stops."""
     try:
-        # Only verify and re-run receipts when the receipts delegation backend is active
-        cfg = getattr(ctx, "config", None) or {}
-        if not is_receipts_backend_active(cfg):
+        # Only verify and re-run receipts when the receipts delegation backend is selected. The
+        # backend is read where core reads it, not from ``ctx.config`` (PluginContext has none).
+        if not _receipts_backend_active(ctx):
             return None
 
         child = str(kwargs.get("child_session_id") or kwargs.get("child_role") or "child")

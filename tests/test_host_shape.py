@@ -22,10 +22,15 @@ import delegation_receipts_plugin as plugin
 
 
 class Ctx:
-    """The smallest ctx the hooks use: config lookups with defaults."""
+    """The smallest ctx the hooks use: config lookups with defaults.
+
+    Defaults to the state the hooks are meant to act in — this plugin selected as
+    ``delegation.backend`` — because a host running the backend is the case under test. The
+    suppression test below passes a different backend.
+    """
 
     def __init__(self, config: dict | None = None) -> None:
-        self._config = config or {}
+        self._config = config or {"delegation": {"backend": "receipts"}}
 
     def get_config(self, key: str, default=None):
         return self._config.get(key, default)
@@ -269,6 +274,25 @@ def test_ok_with_outstanding_work_is_a_mismatch(tmp_path):
     rows = plugin._PENDING[("s1", "t1")]
     assert rows[0]["status"] == "mismatch"
     assert rows[0]["left"] == "tests not written"
+
+
+def test_no_checks_when_another_backend_is_selected(tmp_path):
+    """Review item 3: a receipt block in a child's summary is inert under any other backend."""
+    ctx = Ctx({"delegation": {"backend": "model_map"}})
+    plugin._PENDING.clear()
+    target = tmp_path / "ws" / "data.json"
+    target.parent.mkdir()
+    target.write_text('{"ok": true}\n', encoding="utf-8")
+    plugin._on_subagent_stop(
+        ctx,
+        child_session_id="c6",
+        parent_session_id="s1",
+        parent_turn_id="t1",
+        child_status="completed",
+        child_summary=_receipt(["data.json"], "pytest -q data.json"),
+        tool_call_history=[_write_call(target), _run_call()],
+    )
+    assert not plugin._PENDING, "the receipts hook must stay dark under another backend"
 
 
 def test_resolves_the_child_tree_from_an_absolute_write_target(tmp_path):
