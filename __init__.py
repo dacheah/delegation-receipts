@@ -89,6 +89,21 @@ CONTRACT = (
     "passed, not that the child says it did."
 )
 
+#: The same contract on an install where host re-run is off (the default): the child is told the
+#: truth about what happens to its command rather than that it will be executed.
+CONTRACT_INSPECT_ONLY = (
+    "Every subagent must end its reply with a receipt block, on its own, last:\n"
+    "```receipt\nstatus: ok\nchanged:\n  - path/relative/to/workspace.py\n"
+    "verified: pytest -q tests/test_that_file.py\nleft: none\n```\n"
+    "status is one of ok, partial, blocked, failed. changed lists each file the child wrote. "
+    "verified is the single command that proves the work; it must be a fixed check form "
+    "(pytest, uv run pytest, cargo test, go test, npm test) with no shell syntax. left is the "
+    "unfinished remainder, or none. The receipt is checked against the filesystem: every claimed "
+    "path must exist and must appear in this child's own write history, and the cited command "
+    "must match an allowed check form. The command is not executed on this install, so a "
+    "receipt reads unverified rather than proving a pass."
+)
+
 #: Shown above the contract when the user has model routes configured, so the model knows routing
 #: still works under this backend.
 ROUTE_NOTE = (
@@ -165,7 +180,25 @@ def _timeout(ctx: Any) -> float:
     return value if 1.0 <= value <= 3600.0 else 120.0
 
 
-def _provider_class() -> type:
+def _host_rerun(ctx: Any) -> bool:
+    """Whether this install lets the plugin execute a child's cited command.
+
+    Off unless the operator sets ``plugins.entries.delegation-receipts.settings.host_rerun``:
+    a hook-driven re-run runs with the daemon's privileges and never passes through Hermes'
+    dangerous-command approval, so execution is opt-in.
+    """
+    try:
+        value = ctx.get_config("host_rerun", False)
+    except Exception:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _provider_class(ctx: Any = None) -> type:
     from agent.delegation_provider import DelegationProvider
 
     class ReceiptsDelegationProvider(DelegationProvider):
@@ -177,6 +210,10 @@ def _provider_class() -> type:
         then requires the receipt on top. Installing this is a drop-in switch, not a downgrade.
         """
 
+        def __init__(self) -> None:
+            # Captured at load, so the prompt prefix stays stable for the life of the process.
+            self._contract = CONTRACT if _host_rerun(ctx) else CONTRACT_INSPECT_ONLY
+
         @property
         def name(self) -> str:
             return BACKEND_NAME
@@ -187,9 +224,11 @@ def _provider_class() -> type:
 
         @property
         def summary(self) -> str:
+            executed = "and re-run " if self._contract is CONTRACT else ""
             return (
-                "Subagents must end with a receipt; claimed files and the cited command are "
-                "re-checked when the child stops. Keeps any model_map routes you have configured."
+                "Subagents must end with a receipt; claimed files are checked and the cited "
+                f"command is cross-checked {executed}when the child stops. Keeps any model_map "
+                "routes you have configured."
             )
 
         def task_parameters(self, config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -198,8 +237,8 @@ def _provider_class() -> type:
 
         def description(self, config: Mapping[str, Any]) -> str:
             if options_for(config):
-                return f"{ROUTE_NOTE}\n\n{CONTRACT}"
-            return CONTRACT
+                return f"{ROUTE_NOTE}\n\n{self._contract}"
+            return self._contract
 
         def route_task(self, task: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
             # The route comes from the user's own model_map block; an empty answer means the child
@@ -302,6 +341,7 @@ def _on_subagent_stop(ctx: Any, **kwargs: Any) -> None:
                 child_status=kwargs.get("child_status"),
                 tool_history=history,
                 timeout=_timeout(ctx),
+                allow_rerun=_host_rerun(ctx),
             )
         row = {
             "ts": time.time(),
@@ -441,7 +481,7 @@ def _handle_cli(args: Any) -> int:
 
 def register(ctx: Any) -> None:
     try:
-        provider_cls = _provider_class()
+        provider_cls = _provider_class(ctx)
     except ModuleNotFoundError as exc:
         if exc.name != "agent.delegation_provider":
             raise

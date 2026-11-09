@@ -30,10 +30,34 @@ class Ctx:
     """
 
     def __init__(self, config: dict | None = None) -> None:
-        self._config = config or {"delegation": {"backend": "receipts"}}
+        self._config = config or {"delegation": {"backend": "receipts"}, "host_rerun": True}
 
     def get_config(self, key: str, default=None):
         return self._config.get(key, default)
+
+
+def test_default_install_does_not_execute_the_cited_command(tmp_path):
+    """Review item 1: no host re-run unless the operator turns it on, and the parent is told so."""
+    ctx = Ctx({"delegation": {"backend": "receipts"}})  # no host_rerun: the shipped default
+    plugin._PENDING.clear()
+    target = tmp_path / "ws" / "data.json"
+    target.parent.mkdir()
+    target.write_text('{"ok": true}\n', encoding="utf-8")
+    (target.parent / "test_ok.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+    # A command that would genuinely pass, so only the disabled setting can hold it back.
+    plugin._on_subagent_stop(
+        ctx,
+        child_session_id="c7",
+        parent_session_id="s1",
+        parent_turn_id="t1",
+        child_status="completed",
+        child_summary=_receipt(["data.json"], "pytest -q test_ok.py"),
+        tool_call_history=[_write_call(target), _run_call()],
+    )
+    rows = plugin._PENDING[("s1", "t1")]
+    assert rows[0]["status"] == "unverified"
+    assert rows[0]["rerun"]["skipped"] is True and rows[0]["rerun"]["ran"] is False
+    assert "host re-run is off" in rows[0]["problems"][0]
 
 
 def _core_source() -> Path | None:

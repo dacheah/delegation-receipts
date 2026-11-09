@@ -580,12 +580,17 @@ def verify(
     timeout: float = 120.0,
     require_files: bool = True,
     require_corroboration: bool = True,
+    allow_rerun: bool = True,
 ) -> Verdict:
     """Check one child's claimed work against the world.
 
     A verdict is ``ok`` only when the receipt parses, the status is ``ok``, every claimed path
-    exists, and the cited command is allow-listed, corroborated by the tool history, and exits
-    zero when re-run. Nothing is inferred from prose.
+    exists, and the cited command is allow-listed, corroborated by the tool history, and — when
+    ``allow_rerun`` is set — exits zero when re-run. Nothing is inferred from prose.
+
+    ``allow_rerun=False`` is the default install's behaviour: the command is checked against the
+    same shape rules and the same tool history, but never executed, because a hook-driven re-run
+    does not pass through Hermes' dangerous-command approval.
     """
     verdict = Verdict(child=child, child_status=str(child_status) if child_status else None)
     receipt = parse_receipt(text)
@@ -669,6 +674,22 @@ def verify(
                 "attributed to it"
             )
             return verdict
+
+    if not allow_rerun:
+        # The command was written by the party being checked, and a hook-driven re-run never sees
+        # Hermes' approval prompt, so on a default install it is inspected, not executed.
+        verdict.rerun = {
+            "ran": False,
+            "skipped": True,
+            "reason": "host re-run is disabled (plugins.entries.delegation-receipts.settings.host_rerun)",
+        }
+        verdict.status = "unverified"
+        verdict.problems.append(
+            "the cited command was not run: host re-run is off for this install, so the claim is "
+            "consistent with the child's history but unproven (set "
+            "plugins.entries.delegation-receipts.settings.host_rerun: true to execute it)"
+        )
+        return verdict
 
     run = (runner or run_command)(command, root, timeout=timeout)
     verdict.rerun = run

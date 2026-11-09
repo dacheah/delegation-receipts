@@ -9,14 +9,31 @@ description: >
   machine-checkable receipt (status, changed files, the one command that
   proves the work). When the child stops, the plugin checks each claimed file
   exists, matches the claim against the writes the child's own tool history
-  records, re-runs the cited command with no shell, its own process group and
-  a timeout, and hands the verdict to the parent - inline on the tool result,
-  or on the next turn for a background child. A child that says "all 14 tests
+  records, and checks the cited command against a closed set of fixed check
+  forms; when host re-run is enabled (off by default) it then re-runs that
+  command with no shell, its own process group and a timeout. Either way the
+  verdict goes to the parent - inline on the tool result, or on the next turn
+  for a background child. With host re-run on, a child that says "all 14 tests
   pass" when 3 fail comes back marked unverified with the failing output
-  attached. Claimed-but-never-written work is caught even when the file
-  exists. Set `delegation.backend: receipts`; `hermes receipts` shows the
-  ledger.
+  attached; with it off, a receipt is reported consistent-but-unproven rather
+  than ok. Claimed-but-never-written work is caught even when the file exists.
+  Set `delegation.backend: receipts`; `hermes receipts` shows the ledger.
 requires_hermes: ">=0.22.5"
+config_schema:
+  host_rerun:
+    type: bool
+    default: false
+    description: >-
+      Execute the command a child cites in its receipt, on this host, when the child stops.
+      Off by default: a hook-driven re-run runs with the daemon's privileges and never passes
+      through Hermes' dangerous-command approval. With it off, receipts are still checked against
+      the filesystem, the child's own write history and the allowed command forms, but a cited
+      command reads unverified rather than proved.
+  verify_timeout_seconds:
+    type: int
+    default: 120
+    description: >-
+      Wall-clock limit, in seconds, for one host re-run. Only used when host_rerun is on.
 provides_tools: []
 provides_hooks:
   - subagent_stop

@@ -10,9 +10,10 @@ This plugin makes the claim machine-checkable and then checks it.
 ```
 parent ──delegate_task──▶ child ──"status: ok, changed: [a.py], verified: pytest -q"──┐
    ▲                                                                                  │
-   │        ┌──────────────── subagent_stop ─────────────────┐                        │
-   └────────┤ parse · files exist? · command run? · re-run it ├────────────────────────┘
-            └──────────────── verdict ────────────────────────┘
+   │        ┌──────────────── subagent_stop ────────────────┐                         │
+   │        │─── files exist? · corroborated? · re-run? ────│                         │
+   │        └─────────────────── verdict ───────────────────┘                         │
+   └──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## What it does
@@ -24,8 +25,9 @@ parent ──delegate_task──▶ child ──"status: ok, changed: [a.py], ve
    status and a redacted tool history. The receipt is parsed, every claimed path is resolved and
    hashed, and each claim is **matched against the write targets that child's own history
    records** — so a child cannot take credit for a file that exists because someone else wrote it.
-   The cited command is then checked against an allow-list, re-run with no shell, in its own
-   process group, with output and time bounded.
+   The cited command is then checked against a closed set of fixed check forms. Only on an install
+   that turns host re-run on — it is **off by default** — is it then executed, with no shell, in
+   its own process group, with output and time bounded.
 3. **Tells the parent.** A non-ok verdict is appended to the `delegate_task` result by
    `transform_tool_result`, with the failing output attached. A child dispatched in the background
    returns `dispatched` before it finishes, so its verdict is delivered on the parent's next turn
@@ -71,14 +73,26 @@ write one — so almost everything comes back `missing`.
 | Every `changed` path is workspace-relative and exists | `invalid` |
 | The claim matches a file this child's own history records writing | `unverified` |
 | Something is proven at all: a real artefact, or a command naming one | `unverified` |
-| The cited command is allow-listed, bare-named, shell-free, not a launcher | `unverified` |
+| The cited command is a fixed check form, bare-named, shell-free, not a launcher | `unverified` |
 | The child made a run-style tool call at all | `unverified` |
-| The command exits zero when re-run | `unverified` |
+| The cited command exits zero when re-run — only when host re-run is on | `unverified` |
+| Host re-run is off, so the cited command is inspected but never executed | `unverified`, with the reason attached |
 
-The allow-list is `pytest`, `python`, `python3`, `uv`, `tox`, `nox`, `npm`, `pnpm`, `yarn`, `node`,
-`cargo`, `go`, `make`, `just`, `ruff`, `mypy`, `tsc`, `jest`, `vitest`, `rspec`. Override it with
-`hermes config set plugins.entries.delegation-receipts.allowed_commands '[...]'`. The timeout
-defaults to 120 seconds; `verify_timeout_seconds` changes it.
+The closed set of check forms is `pytest …`, `uv run --no-sync pytest …`, `cargo test`,
+`go test`, `npm test`, `pnpm test`, `yarn test`, each with a small closed flag set
+(`-q`/`-x` for pytest, `--lib`/`--tests`/`--bins` for cargo, `-count=1` for go). There is no
+override: the shapes are the boundary, and `uv run` without `--no-sync` is refused because a sync
+would execute a build backend the child could have authored minutes earlier.
+
+Execution is a separate decision from inspection. `host_rerun` defaults to `false`:
+
+```bash
+hermes config set plugins.entries.delegation-receipts.settings.host_rerun true
+```
+
+With it off, a clean-looking receipt reads `unverified` rather than `ok`, because the plugin can
+prove the claim is consistent with the filesystem and the child's own history but cannot prove the
+command passes. With it on, the timeout defaults to 120 seconds (`verify_timeout_seconds`).
 
 ## What it deliberately does not do
 
@@ -100,10 +114,14 @@ defaults to 120 seconds; `verify_timeout_seconds` changes it.
 
 ## Disclosure
 
-- The cited command is executed **with your privileges** in the agent's working directory. The
-  command comes from the subagent, which is the party being checked, so it is allow-listed by bare
-  name, shell-free, argv-split, refused if it is a launcher (`env`, `xargs`, `find`, `sh`) or an
-  inline evaluation (`python3 -c`, `node -e`), time-bounded (120 s default) and given a filtered
+- **When host re-run is on, the cited command is executed with your privileges** in the agent's
+  working directory. It is off by default, precisely because a `subagent_stop` re-run never passes
+  through Hermes' dangerous-command approval and does not use the child's own terminal backend.
+  Once enabled, the
+  command comes from the subagent, which is the party being checked, so it is restricted to a
+  fixed check form by bare name, shell-free, argv-split, refused if it is a launcher (`env`,
+  `xargs`, `find`, `sh`) or an inline evaluation (`python3 -c`, `node -e`), time-bounded (120 s
+  default) and given a filtered
   environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`, `VIRTUAL_ENV`, `PYTHONPATH`). Output is
   drained through a bounded buffer so a verbose run cannot exhaust memory, and the timeout kills
   the whole process group.
