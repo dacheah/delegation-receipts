@@ -40,7 +40,7 @@ CONTRACT = (
     "verified: pytest -q tests/test_that_file.py\nleft: none\n```\n"
     "status is one of ok, partial, blocked, failed. changed lists each file the child wrote. "
     "verified is the single command that proves the work; it is re-run by the host, so it must be "
-    "an allow-listed executable (pytest, python, npm, cargo, go, make, ruff, mypy, tsc, ...) with no "
+    "a fixed check form (pytest, uv run pytest, cargo test, go test, npm test) with no "
     "shell syntax, and it must exit zero. left is the unfinished remainder, or none. "
     "A receipt is checked against the filesystem and re-executed: status ok means the command "
     "passed, not that the child says it did."
@@ -226,6 +226,11 @@ def _render(rows: Sequence[Mapping[str, Any]], *, header: str) -> str:
 def _on_subagent_stop(ctx: Any, **kwargs: Any) -> None:
     """Check one child's receipt the moment it stops."""
     try:
+        # Only verify and re-run receipts when the receipts delegation backend is active
+        cfg = getattr(ctx, "config", None) or {}
+        if not is_receipts_backend_active(cfg):
+            return None
+
         child = str(kwargs.get("child_session_id") or kwargs.get("child_role") or "child")
         key = (
             str(kwargs.get("parent_session_id") or ""),
