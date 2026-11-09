@@ -27,6 +27,14 @@ from typing import Any, Mapping, Sequence
 from .engine import Verdict, parse_receipt, verify
 from .routing import option_parameter, options_for, resolve_route
 
+def is_receipts_backend_active(config: Mapping[str, Any] | None) -> bool:
+    if not config:
+        return False
+    delegation = config.get("delegation")
+    if isinstance(delegation, Mapping):
+        return delegation.get("backend") == BACKEND_NAME
+    return False
+
 logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "delegation-receipts"
